@@ -113,6 +113,7 @@ pub use event_loop::{
 };
 pub use handler::{
     Handler,
+    HandlerExt,
 };
 pub use io::{
     TryRead,

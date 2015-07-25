@@ -1,4 +1,4 @@
-use {Handler, Evented, Poll, NotifyError, Token};
+use {HandlerExt, Evented, Poll, NotifyError, Token};
 use event::{IoEvent, EventSet, PollOpt};
 use notify::Notify;
 use timer::{Timer, Timeout, TimerResult};
@@ -35,7 +35,7 @@ impl Default for EventLoopConfig {
 
 /// Single threaded IO event loop.
 #[derive(Debug)]
-pub struct EventLoop<H: Handler> {
+pub struct EventLoop<H: HandlerExt> {
     run: bool,
     poll: Poll,
     timer: Timer<H::Timeout>,
@@ -46,7 +46,7 @@ pub struct EventLoop<H: Handler> {
 // Token used to represent notifications
 const NOTIFY: Token = Token(usize::MAX);
 
-impl<H: Handler> EventLoop<H> {
+impl<H: HandlerExt> EventLoop<H> {
 
     /// Initializes a new event loop using default configuration settings. The
     /// event loop will not be running yet.
@@ -208,7 +208,7 @@ impl<H: Handler> EventLoop<H> {
 
     /// Keep spinning the event loop indefinitely, and notify the handler whenever
     /// any of the registered handles are ready.
-    pub fn run(&mut self, handler: &mut H) -> io::Result<()> {
+    pub fn run(&mut self, handler: &mut H) -> Result<(), H::Error> {
         self.run = true;
 
         while self.run {
@@ -227,7 +227,7 @@ impl<H: Handler> EventLoop<H> {
     /// Spin the event loop once, with a timeout of one second, and notify the
     /// handler if any of the registered handles become ready during that
     /// time.
-    pub fn run_once(&mut self, handler: &mut H) -> io::Result<()> {
+    pub fn run_once(&mut self, handler: &mut H) -> Result<(), H::Error> {
         let mut messages;
 
         trace!("event loop tick");
@@ -243,14 +243,11 @@ impl<H: Handler> EventLoop<H> {
         // one second before it takes effect.
         let events = match self.io_poll(pending) {
             Ok(e) => e,
-            Err(err) => {
-                if err.kind() == io::ErrorKind::Interrupted {
-                    handler.interrupted(self);
-                    0
-                } else {
-                    return Err(err);
-                }
-            }
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {
+                try!(handler.interrupted(self));
+                0
+            },
+            Err(err) => return Err(From::from(err)),
         };
 
         if !pending {
@@ -260,10 +257,9 @@ impl<H: Handler> EventLoop<H> {
             messages += self.notify.check(remaining, false);
         }
 
-        self.io_process(handler, events);
-        self.notify(handler, messages);
-        self.timer_process(handler);
-        Ok(())
+        try!(self.io_process(handler, events));
+        try!(self.notify(handler, messages));
+        self.timer_process(handler)
     }
 
     #[inline]
@@ -282,38 +278,32 @@ impl<H: Handler> EventLoop<H> {
     }
 
     // Process IO events that have been previously polled
-    fn io_process(&mut self, handler: &mut H, cnt: usize) {
-        let mut i = 0;
-
+    fn io_process(&mut self, handler: &mut H, cnt: usize) -> Result<(), H::Error> {
         // Iterate over the notifications. Each event provides the token
         // it was registered with (which usually represents, at least, the
         // handle that the event is about) as well as information about
         // what kind of event occurred (readable, writable, signal, etc.)
-        while i < cnt {
+        for i in 0..cnt {
             let evt = self.poll.event(i);
 
             trace!("event={:?}", evt);
 
             match evt.token {
                 NOTIFY => self.notify.cleanup(),
-                _ => self.io_event(handler, evt)
+                _ => try!(self.io_event(handler, evt)),
             }
-
-            i += 1;
         }
+        Ok(())
     }
 
-    fn io_event(&mut self, handler: &mut H, evt: IoEvent) {
-        handler.ready(self, evt.token, evt.kind);
+    fn io_event(&mut self, handler: &mut H, evt: IoEvent) -> Result<(), H::Error> {
+        handler.ready(self, evt.token, evt.kind)
     }
 
-    fn notify(&mut self, handler: &mut H, mut cnt: usize) {
-        while cnt > 0 {
+    fn notify(&mut self, handler: &mut H, cnt: usize) -> Result<(), H::Error> {
+        for _ in 0..cnt{
             match self.notify.poll() {
-                Some(msg) => {
-                    handler.notify(self, msg);
-                    cnt -= 1;
-                },
+                Some(msg) => try!(handler.notify(self, msg)),
                 // If we expect messages, but the queue seems empty, a context
                 // switch has occurred in the queue's push() method between
                 // reserving a slot and marking that slot; let's spin for
@@ -322,23 +312,24 @@ impl<H: Handler> EventLoop<H> {
                 None => thread::yield_now(),
             }
         }
+        Ok(())
     }
 
-    fn timer_process(&mut self, handler: &mut H) {
+    fn timer_process(&mut self, handler: &mut H) -> Result<(), H::Error> {
         let now = self.timer.now();
 
         loop {
             match self.timer.tick_to(now) {
-                Some(t) => handler.timeout(self, t),
-                _ => return
+                Some(t) => try!(handler.timeout(self, t)),
+                _ => return Ok(()),
             }
         }
     }
 }
 
-unsafe impl<H: Handler> Sync for EventLoop<H> { }
+unsafe impl<H: HandlerExt> Sync for EventLoop<H> { }
 
-impl <H: Handler> Drop for EventLoop<H> {
+impl <H: HandlerExt> Drop for EventLoop<H> {
     fn drop(&mut self) {
         self.notify.close();
     }
